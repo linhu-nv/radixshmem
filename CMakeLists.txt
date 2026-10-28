@@ -335,6 +335,8 @@ set(_core_unit_tests
     test_rht_engine
     # PeerBreaker: skip/probe/backoff of an unreachable peer.
     test_peer_breaker
+    # Pressure migration: peek_lru_leaf_paths / evict_chain.
+    test_tree_migration
 )
 foreach(_t ${_core_unit_tests})
     add_executable(${_t} tests/indexer/core/${_t}.cpp)
