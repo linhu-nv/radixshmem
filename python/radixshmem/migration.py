@@ -11,9 +11,9 @@ Two threads per data-mode cluster server:
   counts under ``radix/<cluster_id>/capacity/<node>`` on a lease, so the key
   goes away with the process. Every node publishes, migrating or not; it is
   how a source learns which peers can take data.
-* ``PressureMigrator`` (``MigrationConfig.enabled``) runs rounds. A round
-  starts when some pool's free share is below ``trigger_free_ratio`` and stops
-  once every pool is back above ``target_free_ratio``. It peeks the coldest
+* ``PressureMigrator`` (``MigrationConfig.enabled``) runs rounds from the
+  moment some pool's free share drops below ``trigger_free_ratio`` until every
+  pool is back at ``target_free_ratio`` (hysteresis). A round peeks the coldest
   unpinned leaves as full root->leaf hash paths and, for each one:
 
   1. pins the path locally: FULL ``[0, n)``, plus the SWA window and the Mamba
@@ -193,6 +193,7 @@ class PressureMigrator:
         self._threads: List[threading.Thread] = []
         self._peers: List[_Peer] = []
         self._peers_at = -1e9
+        self._active = False     # between crossing trigger_free_ratio and reaching target_free_ratio
         self.stats: Counter = Counter()
         self.last_error = ""
         self._last_publish = 0.0
@@ -255,8 +256,11 @@ class PressureMigrator:
 
     def _migrate_loop(self) -> None:
         while not self._stop.is_set():
+            t0 = time.monotonic()
             try:
                 busy = self.run_round()
+                if busy:
+                    self.stats["busy_ms"] += int((time.monotonic() - t0) * 1000)
             except Exception as e:  # noqa: BLE001 - keep the thread; the round is retried
                 self.stats["round_errors"] += 1
                 self.last_error = f"{type(e).__name__}: {e}"
@@ -270,7 +274,12 @@ class PressureMigrator:
         """One round: True when it moved data (the caller loops on), False when
         idle, None when under pressure but no peer can take FULL data (back off)."""
         c = self.cfg
-        if self._local_free() >= c.trigger_free_ratio:
+        free = self._local_free()
+        if free < c.trigger_free_ratio:
+            self._active = True
+        elif free >= c.target_free_ratio:
+            self._active = False
+        if not self._active:
             return False
         now = time.monotonic()
         if now - self._peers_at >= c.publish_interval_s:   # records change no faster
