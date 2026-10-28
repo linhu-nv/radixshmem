@@ -36,6 +36,7 @@ import threading
 import time
 
 from radixshmem import _geometry
+from radixshmem.migration import MigrationConfig
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
 
 _SIZE = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
@@ -132,6 +133,25 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="gRPC threads; one blocks per client with jobs in flight (default: 32)")
     g.add_argument("--interval", type=int, default=5, help="stats interval in seconds, 0 = silent")
 
+    g = p.add_argument_group("pressure migration (cluster data mode)")
+    g.add_argument("--node-role", default="prefill", choices=["prefill", "decode"],
+                   help="published with the node's capacity; decode nodes are the preferred "
+                        "migration targets (default: prefill)")
+    g.add_argument("--enable-pressure-migration", action="store_true",
+                   help="push the coldest prefixes to a peer with room when a slot pool runs low")
+    g.add_argument("--migrate-trigger-free-ratio", type=float, default=0.15,
+                   help="start when some pool's free share drops below this (default: 0.15)")
+    g.add_argument("--migrate-target-free-ratio", type=float, default=0.20,
+                   help="stop once every pool is back at or above this (default: 0.20)")
+    g.add_argument("--migrate-min-peer-free-ratio", type=float, default=0.10,
+                   help="a target needs this free share in every pool it receives (default: 0.10)")
+    g.add_argument("--migrate-prefill-peer-free-ratio", type=float, default=0.30,
+                   help="free share a prefill-role target needs; used only when no decode "
+                        "node qualifies (default: 0.30)")
+    g.add_argument("--migrate-batch", type=int, default=8, help="leaves per round (default: 8)")
+    g.add_argument("--migrate-max-blocks", type=int, default=512,
+                   help="deepest path migrated; deeper ones are left to eviction (default: 512)")
+
     g = p.add_argument_group("distributed (--expected-min-nodes or --num-rht-shards > 1)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
@@ -189,7 +209,14 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
         evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
-        cluster=cluster, **kw)
+        cluster=cluster, node_role=a.node_role,
+        migration=MigrationConfig(
+            enabled=a.enable_pressure_migration,
+            trigger_free_ratio=a.migrate_trigger_free_ratio,
+            target_free_ratio=a.migrate_target_free_ratio,
+            min_peer_free_ratio=a.migrate_min_peer_free_ratio,
+            prefill_peer_free_ratio=a.migrate_prefill_peer_free_ratio,
+            batch=a.migrate_batch, max_blocks=a.migrate_max_blocks), **kw)
 
 
 def _stats_line(srv: RadixServer) -> str:
@@ -207,6 +234,11 @@ def _stats_line(srv: RadixServer) -> str:
         line += (f"  peer_down={s['peer_down_events']}  rht_drop={s['rht_writes_dropped']}"
                  f"/{s['rht_removes_dropped']}  lookup_skip={s['rht_lookups_skipped']}"
                  f"  walk_skip={s['walks_skipped']}")
+    m = s.get("migration")
+    if m and (m.get("enabled") or m.get("migrated_paths")):
+        line += (f"  migrate={m.get('migrated_paths', 0)} paths/{m.get('pushed_blocks', 0)} blk"
+                 f" (dedup {m.get('dedup_blocks', 0)}, freed {m.get('freed_blocks', 0)},"
+                 f" no_target {m.get('no_target', 0)})")
     if s["transfers"] or s["pending_jobs"]:
         line += (f"  xfers={s['transfers']}({s['transfer_failures']} failed, "
                  f"{fmt_size(s['transfer_bytes'])})  jobs={s['pending_jobs']}")

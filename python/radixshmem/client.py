@@ -37,8 +37,10 @@ MODE_CLOSED = "closed"
 
 _ATTACH_TIMEOUT_MS = 30000          # a ready server's SlotStore is complete; attach never spins long
 
-# (peer_rank, kind, remote_slots, local_slots) -> (ok, bytes, descriptors, error)
+# (peer_rank, kind, remote_slots, local_slots[, op]) -> (ok, bytes, descriptors, error).
+# op is XFER_READ ("r", the default: peer -> local) or XFER_WRITE ("w": local -> peer).
 TransferItem = Tuple[int, int, List[int], List[int]]
+XFER_READ, XFER_WRITE = "r", "w"
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -144,9 +146,12 @@ class _Rpc:
         return NodeInfo(**self._stub.call("Configure", {"geometry": spec}, timeout=30))
 
     def submit(self, items, timeout_ms) -> int:
-        req = {"items": [[int(r), int(k), [int(x) for x in rs], [int(x) for x in ls]]
-                         for r, k, rs, ls in items], "timeout_ms": int(timeout_ms)}
+        req = {"items": [[int(it[0]), int(it[1]), [int(x) for x in it[2]], [int(x) for x in it[3]],
+                          *it[4:5]] for it in items], "timeout_ms": int(timeout_ms)}
         return int(self._stub.call("Submit", req, timeout=30)["ticket"])
+
+    def stats(self) -> Dict[str, Any]:
+        return self._stub.call("Stats", timeout=30)
 
     def wait_any(self, tickets, timeout_ms) -> Dict[str, Any]:
         r = self._stub.call("WaitAny", {"tickets": list(tickets), "timeout_ms": int(timeout_ms)},
@@ -217,6 +222,10 @@ class RadixClient:
         """The server's state now: one RPC, no waiting. Refreshes ``info``."""
         self.info = self._t.describe()
         return self.info
+
+    def server_stats(self) -> Dict[str, Any]:
+        """The server's counters (``RadixServer.stats``), including ``migration``."""
+        return self._t.stats()
 
     def configure(self, geometry) -> NodeInfo:
         """Hand the server a geometry; returns as soon as it is validated and

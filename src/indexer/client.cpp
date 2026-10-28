@@ -394,6 +394,17 @@ PeerFaultCounters* RadixClient::peer_faults() const {
     return local_ ? local_->tree().peer_faults() : nullptr;
 }
 
+std::vector<std::vector<uint64_t>> RadixClient::peek_lru_leaf_paths(int max_leaves,
+                                                                     int max_blocks,
+                                                                     int scan_limit) {
+    if (!local_) return {};
+    return local_->tree().peek_lru_leaf_paths(max_leaves, max_blocks, scan_limit);
+}
+
+int RadixClient::evict_chain(const uint64_t* hashes, int n) {
+    return local_ ? local_->tree().evict_chain(hashes, n) : 0;
+}
+
 void RadixClient::remove_evicted_from_rht(const EvictedKey* entries, int count) {
     if (!rht_conn_ || count <= 0) return;
     int my_rank = peer_reg_->my_rank();
@@ -909,31 +920,33 @@ void RadixClient::dec_ref_remote(int remote_node, const uint64_t* hashes,
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-AllocateReply RadixClient::remote_allocate(int rank, int n) {
+AllocateReply RadixClient::remote_allocate(int rank, int n, ComponentType component) {
     AllocateReply out;
     if (n <= 0) return out;                       // nothing to allocate, status OK
     RemotePeer* p = peer_for(rank);
     if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
-    return p->allocate(n);            // serializes + caps internally
+    return p->allocate(n, component); // serializes + caps internally
 }
 
 InsertResult RadixClient::remote_insert(int rank,
                                         const uint64_t* hashes, int n,
                                         int start, int length,
-                                        const int32_t* slots, bool auto_recycle) {
+                                        const int32_t* slots, bool auto_recycle,
+                                        ComponentType component) {
     InsertResult out;
     RemotePeer* p = peer_for(rank);
     if (!p) { out.error = InsertError::REMOTE_FAILED; return out; }
-    return p->insert(hashes, n, start, length, slots, auto_recycle);
+    return p->insert(hashes, n, start, length, slots, auto_recycle, component);
 }
 
-RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
+RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                         ComponentType component) {
     // slots discriminate RemotePeer::release; null would fall into QUERY_RELEASE.
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
     RemotePeer* p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
     return p->release(/*hashes=*/nullptr, /*n=*/0, /*start=*/0,
-                      /*length=*/num_slots, slots);
+                      /*length=*/num_slots, slots, component);
 }
 
 QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,

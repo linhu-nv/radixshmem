@@ -132,6 +132,8 @@ public:
     uint32_t mempool_used() const;
     uint32_t swa_mempool_total() const;
     uint32_t mamba_mempool_total() const;
+    uint32_t swa_mempool_free() const;
+    uint32_t mamba_mempool_free() const;
     ComponentConfig component_config() const;
 
     uint64_t insert_success_count() const;

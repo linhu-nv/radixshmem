@@ -70,6 +70,8 @@ uint32_t RadixServer::mempool_free()  const { return tree_->mempool_free();  }
 uint32_t RadixServer::mempool_used()  const { return tree_->mempool_used();  }
 uint32_t RadixServer::swa_mempool_total()   const { return tree_->swa_mempool_total();   }
 uint32_t RadixServer::mamba_mempool_total() const { return tree_->mamba_mempool_total(); }
+uint32_t RadixServer::swa_mempool_free()    const { return tree_->swa_mempool_free();    }
+uint32_t RadixServer::mamba_mempool_free()  const { return tree_->mamba_mempool_free();  }
 ComponentConfig RadixServer::component_config() const { return tree_->component_config(); }
 
 uint64_t RadixServer::insert_success_count() const { return tree_->insert_success_count(); }

@@ -406,6 +406,8 @@ PYBIND11_MODULE(_core, m) {
         .def("mempool_used", &RadixServer::mempool_used)
         .def("swa_mempool_total", &RadixServer::swa_mempool_total)
         .def("mamba_mempool_total", &RadixServer::mamba_mempool_total)
+        .def("swa_mempool_free", &RadixServer::swa_mempool_free)
+        .def("mamba_mempool_free", &RadixServer::mamba_mempool_free)
         .def_property_readonly("component_config", &RadixServer::component_config)
         .def("insert_success_count", &RadixServer::insert_success_count)
         .def("peer_fault_counts",
@@ -555,6 +557,30 @@ PYBIND11_MODULE(_core, m) {
             c.recycle_slots(ptr, len, component);
         }, py::arg("slots"), py::arg("component") = ComponentType::FULL)
 
+        .def("peek_lru_leaf_paths", [](RadixClient& c, int max_leaves, int max_blocks,
+                                        int scan_limit) {
+            std::vector<std::vector<uint64_t>> paths;
+            { py::gil_scoped_release rel;
+              paths = c.peek_lru_leaf_paths(max_leaves, max_blocks, scan_limit); }
+            py::list out;
+            for (const auto& p : paths) {
+                py::array_t<uint64_t> arr(static_cast<py::ssize_t>(p.size()));
+                std::memcpy(arr.mutable_data(), p.data(), p.size() * sizeof(uint64_t));
+                out.append(std::move(arr));
+            }
+            return out;
+        }, py::arg("max_leaves"), py::arg("max_blocks"), py::arg("scan_limit") = 0,
+           "Up to max_leaves unpinned LRU leaves (coldest first) as full root->leaf "
+           "hash paths; deeper than max_blocks are skipped. Touches and pins nothing.")
+
+        .def("evict_chain", [](RadixClient& c, py::array_t<uint64_t> hashes) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            py::gil_scoped_release rel;
+            return c.evict_chain(ptr, len);
+        }, py::arg("hashes"),
+           "Evict the chain the path ends in (leaf whose END is len(hashes), then "
+           "ancestors left childless and unpinned); returns FULL blocks freed.")
+
         .def("reset", &RadixClient::reset,
              py::call_guard<py::gil_scoped_release>(),
              "Clear all cached data in place; invalidates prior slot IDs.")
@@ -587,18 +613,19 @@ PYBIND11_MODULE(_core, m) {
         }, "Lock-free leak audit; returns the full HealthReport.")
 #ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
-        .def("remote_allocate", [](RadixClient& c, int rank, int n) {
+        .def("remote_allocate", [](RadixClient& c, int rank, int n,
+                                   ComponentType component) {
             AllocateReply rep;
-            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n); }
+            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n, component); }
             return rep;
-        }, py::arg("rank"), py::arg("n"),
-           "Phase 1: allocate `n` slots on `rank` (no hashes, no dedup).")
+        }, py::arg("rank"), py::arg("n"), py::arg("component") = ComponentType::FULL,
+           "Phase 1: allocate `n` slots from `rank`'s `component` pool (no hashes, no dedup).")
 
         .def("remote_insert", [](RadixClient& c, int rank,
                                    py::array_t<uint64_t> hashes,
                                    int start, int length,
                                    py::array_t<int32_t> slots,
-                                   bool auto_recycle) {
+                                   bool auto_recycle, ComponentType component) {
             auto [ptr, len] = npy_1d(hashes, "hashes");
             auto [sptr, slen] = npy_1d(slots, "slots");
             if (slen < length)
@@ -606,20 +633,20 @@ PYBIND11_MODULE(_core, m) {
             InsertResult res;
             { py::gil_scoped_release rel;
               res = c.remote_insert(rank, ptr, len, start, length, sptr,
-                                    auto_recycle); }
+                                    auto_recycle, component); }
             return res;
         }, py::arg("rank"), py::arg("hashes"), py::arg("start"),
            py::arg("length"), py::arg("slots"),
-           py::arg("auto_recycle") = true,
+           py::arg("auto_recycle") = true, py::arg("component") = ComponentType::FULL,
            "Phase 2: publish `slots` on `rank`; auto_recycle frees the unmatched surplus.")
 
         .def("remote_recycle", [](RadixClient& c, int rank,
-                                  py::array_t<int32_t> slots) {
+                                  py::array_t<int32_t> slots, ComponentType component) {
             auto [sptr, slen] = npy_1d(slots, "slots");
             RemoteStatus st;
-            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen); }
+            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen, component); }
             return st;
-        }, py::arg("rank"), py::arg("slots"),
+        }, py::arg("rank"), py::arg("slots"), py::arg("component") = ComponentType::FULL,
            "Return unpublished slots to `rank`'s pool (abort / surplus); returns RemoteStatus.")
 
         .def("remote_query", [](RadixClient& c, int rank,

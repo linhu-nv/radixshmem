@@ -36,7 +36,8 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
-                             NodeInfo, TransferItem, TransferReply)
+                             XFER_READ, XFER_WRITE, NodeInfo, TransferItem, TransferReply)
+from radixshmem.migration import ROLE_DECODE, ROLE_PREFILL, MigrationConfig, PressureMigrator
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy
 
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
@@ -121,10 +122,16 @@ class ServerConfig:
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     rpc_workers: int = 32            # one blocks per client with jobs in flight
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
+    # pressure migration (radixshmem.migration); a cluster data-mode node always
+    # publishes its capacity, migrating only when migration.enabled
+    node_role: str = ROLE_PREFILL    # "prefill" | "decode": decode nodes are the preferred targets
+    migration: MigrationConfig = field(default_factory=MigrationConfig)
 
     def __post_init__(self) -> None:
         if self.data_bytes < 0:
             raise ValueError("data_bytes must be >= 0")
+        if self.node_role not in (ROLE_PREFILL, ROLE_DECODE):
+            raise ValueError(f"node_role must be {ROLE_PREFILL!r} or {ROLE_DECODE!r}")
         for k in ("swa_ratio", "mamba_ratio"):
             if not 0.0 <= float(getattr(self, k)) < 1.0:
                 raise ValueError(f"{k} must be in [0, 1)")
@@ -212,6 +219,15 @@ class _GeometryRegistry:
             pass
 
 
+def _parse_item(item) -> Tuple[int, int, List[int], List[int], str]:
+    """A TransferItem with its op made explicit (4-tuples are reads)."""
+    r, k, rs, ls = item[:4]
+    op = item[4] if len(item) > 4 else XFER_READ
+    if op not in (XFER_READ, XFER_WRITE):
+        raise ValueError(f"unknown transfer op {op!r}")
+    return int(r), int(k), [int(x) for x in rs], [int(x) for x in ls], op
+
+
 class _Job:
     __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters")
 
@@ -251,6 +267,7 @@ class RadixServer:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self.transfers = self.transfer_failures = self.transfer_bytes = 0
+        self._migrator: Optional[PressureMigrator] = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -318,6 +335,9 @@ class RadixServer:
 
     def close(self) -> None:
         self._stop.set()
+        if self._migrator is not None:
+            self._migrator.close()
+            self._migrator = None
         if self._poller is not None:
             self._poller.join(2)
             self._poller = None
@@ -372,6 +392,15 @@ class RadixServer:
     @property
     def index(self):
         return self._index
+
+    @property
+    def iclient(self):
+        """The server's own RadixClient on its index (remote ops, local queries)."""
+        return self._iclient
+
+    @property
+    def migrator(self) -> Optional[PressureMigrator]:
+        return self._migrator
 
     @property
     def geometry(self) -> Optional[Dict[str, Any]]:
@@ -449,6 +478,12 @@ class RadixServer:
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
+            if self._xfer is not None:   # cluster data mode: publish capacity, maybe migrate
+                try:
+                    self._migrator = PressureMigrator(self).start()
+                except Exception as e:  # noqa: BLE001 - the server serves without it
+                    with self._cv:
+                        self.last_error = f"pressure migration not started: {type(e).__name__}: {e}"
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:
@@ -519,6 +554,8 @@ class RadixServer:
                        insert_errors=idx.insert_error_node_pool_count()
                        + idx.insert_error_data_pool_count() + idx.insert_error_ht_pool_count(),
                        **idx.peer_fault_counts())
+        if self._migrator is not None:
+            out["migration"] = self._migrator.snapshot()
         return out
 
     # ------------------------------------------------------------ bring-up
@@ -582,9 +619,8 @@ class RadixServer:
             raise DataPlaneUnavailable("index-only server has no data plane")
         if self._xfer is None:
             raise DataPlaneUnavailable("standalone server has no peers")
-        job = _Job([(int(r), int(k), [int(x) for x in rs], [int(x) for x in ls])
-                    for r, k, rs, ls in items], time.monotonic() + timeout_ms / 1000)
-        for i, (rank, _, _, _) in enumerate(job.items):
+        job = _Job([_parse_item(it) for it in items], time.monotonic() + timeout_ms / 1000)
+        for i, (rank, _, _, _, _) in enumerate(job.items):
             try:
                 job.segs.append(self._peer(rank))
             except Exception as e:  # noqa: BLE001
@@ -660,16 +696,19 @@ class RadixServer:
                     job = self._queue.popleft() if self._queue else None
                 if job is None:
                     break
-                for i, (rank, kind, remote, local) in enumerate(job.items):
+                for i, (rank, kind, remote, local, op) in enumerate(job.items):
                     if job.replies[i] is not None:
                         continue
                     try:
-                        h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
+                        if op == XFER_WRITE:
+                            h, nd = self._xfer.write(job.segs[i], local, remote, kind=ComponentType(kind))
+                        else:
+                            h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
                     except Exception as e:  # noqa: BLE001
                         h, nd = _data.INVALID_BATCH, str(e)
                     if h == _data.INVALID_BATCH:
                         self._peers.pop(rank, None)
-                        self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
+                        self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else f"{op} rejected"))
                     else:
                         inflight.append((job, i, h, nd))
             progressed, now, still = False, time.monotonic(), []

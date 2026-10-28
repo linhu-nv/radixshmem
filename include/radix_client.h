@@ -64,17 +64,20 @@ public:
     RemotePeer(const RemotePeer&) = delete;
     RemotePeer& operator=(const RemotePeer&) = delete;
 
-    AllocateReply allocate(int n);   // pure slot alloc; no hashes, no dedup
+    // pure slot alloc from the target's `component` pool; no hashes, no dedup
+    AllocateReply allocate(int n, ComponentType component = ComponentType::FULL);
 
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
-                        const int32_t* slots, bool auto_recycle = true);
+                        const int32_t* slots, bool auto_recycle = true,
+                        ComponentType component = ComponentType::FULL);
 
     QueryReply query(const uint64_t* hashes, int n, bool lock = false,
                      bool update_meta = true);
 
     // Returns the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
     RemoteStatus release(const uint64_t* hashes, int n, int start, int length,
-                 const int32_t* slots = nullptr);
+                 const int32_t* slots = nullptr,
+                 ComponentType component = ComponentType::FULL);
 
     const std::string& endpoint() const { return endpoint_; }
 
@@ -91,7 +94,8 @@ private:
 
     RemoteStatus send_ack_op(uint16_t op, const uint64_t* hashes, int n,
                      int start, int length, const int32_t* slots,
-                     uint16_t flags = 0);
+                     uint16_t flags = 0,
+                     ComponentType component = ComponentType::FULL);
 
     std::unique_lock<std::mutex> guard() const {
         return op_mu_ ? std::unique_lock<std::mutex>(*op_mu_)
@@ -185,6 +189,12 @@ public:
     // without a local tree.
     PeerFaultCounters* peer_faults() const;
 
+    // Pressure migration helpers on the local tree (empty / 0 for an observer);
+    // see RadixShmemTree::peek_lru_leaf_paths / evict_chain.
+    std::vector<std::vector<uint64_t>> peek_lru_leaf_paths(int max_leaves, int max_blocks,
+                                                           int scan_limit = 0);
+    int evict_chain(const uint64_t* hashes, int n);
+
     // Server-side eviction client: remove RHT entries for locally-evicted nodes
     // (only cells still matching this rank). Empty list ok; flushes at end.
     struct EvictedKey { uint64_t first_hash; uint32_t tree_node_id; };
@@ -197,16 +207,21 @@ public:
     // opens/reuses one cached session per rank internally. An illegal rank yields
     // BAD_TARGET / REMOTE_FAILED in the op result (never throws).
 
-    // Phase 1: allocate `n` slots on the peer (no hashes, no dedup).
-    AllocateReply remote_allocate(int rank, int n);
+    // Phase 1: allocate `n` slots from the peer's `component` pool (no hashes, no dedup).
+    AllocateReply remote_allocate(int rank, int n,
+                                  ComponentType component = ComponentType::FULL);
 
     // Phase 2: publish `slots` on the peer; dedup + surplus recycle happen here.
+    // FULL is the positional prefix insert; SWA / MAMBA follow the local insert's
+    // component contract (start == 0, slots cover the tail / the END).
     InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
                                int start, int length, const int32_t* slots,
-                               bool auto_recycle = true);
+                               bool auto_recycle = true,
+                               ComponentType component = ComponentType::FULL);
 
-    // Recycle unpublished slots on the peer (abort / auto_recycle=false surplus).
-    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots);
+    // Recycle unpublished slots into the peer's `component` pool (abort / surplus).
+    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                ComponentType component = ComponentType::FULL);
 
     QueryResult remote_query(int rank, const uint64_t* hashes, int n,
                              bool lock = false, bool update_meta = true);

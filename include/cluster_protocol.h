@@ -68,7 +68,7 @@ struct ClusterReplyMsg {
     union ibv_gid gid;
 };
 
-constexpr uint32_t REMOTE_OP_PROTOCOL_VERSION = 6;
+constexpr uint32_t REMOTE_OP_PROTOCOL_VERSION = 7;
 constexpr uint32_t REMOTE_OP_REQ_MAGIC   = 0x52494E53; // "RINS"
 constexpr uint32_t REMOTE_OP_REPLY_MAGIC = 0x52494E52; // "RINR"
 constexpr uint16_t REMOTE_OP_INSERT_RESERVE = 1;   // allocate n slots (n=count, no hashes, no dedup)
@@ -88,7 +88,7 @@ struct RemoteOpReqHeader {
     uint16_t version;              // REMOTE_OP_PROTOCOL_VERSION
     uint16_t op;                   // discriminant: REMOTE_OP_* above
     uint16_t flags;                // REMOTE_OP_FLAG_* (INSERT: recycle control)
-    uint16_t _pad;
+    uint16_t component;            // ComponentType pool of RESERVE / INSERT / INSERT_RELEASE (v7); 0 = FULL
     int32_t  n;                    // number of hashes (<= MAX); payload length
     uint64_t req_id;               // echoed back for matching / late-reply discard
     union {

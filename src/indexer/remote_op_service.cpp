@@ -140,13 +140,15 @@ std::vector<char> RadixServer::handle_insert(const RemoteOpReqHeader& req,
                                              const uint64_t* /*hashes*/) {
     // ALLOCATE: pure slot alloc of req.n (no hashes, no dedup). Dedup happens
     // in the phase-2 INSERT (local insert consumes only the unmatched tail).
+    // v7: the pool comes from req.component (validated in rc_loop).
+    const auto comp = static_cast<ComponentType>(req.component);
     std::vector<int32_t> slots;
     uint16_t error = static_cast<uint16_t>(InsertError::OK);
     if (req.n > 0) {
         std::lock_guard<std::mutex> g(svc_client_mu_);
-        int got = svc_tree_->allocate_slots(req.n, slots);
+        int got = svc_tree_->allocate_slots(req.n, slots, comp);
         if (got < req.n) {
-            svc_tree_->recycle_slots(slots.data(), got);
+            svc_tree_->recycle_slots(slots.data(), got, comp);
             slots.clear();
             error = static_cast<uint16_t>(InsertError::MEMPOOL_FULL);
         }
@@ -174,6 +176,7 @@ std::vector<char> RadixServer::handle_insert(const RemoteOpReqHeader& req,
 std::vector<char> RadixServer::handle_finalize_like(const RemoteOpReqHeader& req,
                                                     const uint64_t* hashes) {
     const auto& f = req.u.insert;
+    const auto comp = static_cast<ComponentType>(req.component);
     const int32_t* slots = reinterpret_cast<const int32_t*>(hashes + req.n);
     uint16_t error = 0;
     std::vector<int32_t> unused;   // INSERT: slots this publish did not consume
@@ -183,11 +186,11 @@ std::vector<char> RadixServer::handle_finalize_like(const RemoteOpReqHeader& req
             // Recycle by flag: unset → server recycles; set → initiator recycles.
             bool ar = !(req.flags & REMOTE_OP_FLAG_NO_AUTO_RECYCLE);
             InsertResult r = svc_client_->insert(hashes, req.n, slots, f.length,
-                                                 f.start, /*auto_recycle=*/ar);
+                                                 f.start, /*auto_recycle=*/ar, comp);
             error  = static_cast<uint16_t>(r.error);
             unused = std::move(r.unused_slots);
         } else if (req.op == REMOTE_OP_INSERT_RELEASE) {
-            svc_tree_->recycle_slots(slots, f.length);
+            svc_tree_->recycle_slots(slots, f.length, comp);
         } else {   // REMOTE_OP_QUERY_RELEASE
             // Drop the pin a query(lock=true) placed: rebuild the fully-inside
             // record from the wire range and release through the component pair.
@@ -262,6 +265,7 @@ void RadixServer::rc_loop(int lane) {
                     auto* h = reinterpret_cast<RemoteOpReqHeader*>(rbuf.data());
                     bool ok = h->magic == REMOTE_OP_REQ_MAGIC &&
                               h->version == REMOTE_OP_PROTOCOL_VERSION &&
+                              h->component < (uint16_t)NUM_COMPONENT_TYPES &&
                               h->n >= 0 && h->n <= MAX_REMOTE_OP_BLOCKS;
                     if (ok) {
                         // RESERVE carries no hashes (h->n is the alloc count);

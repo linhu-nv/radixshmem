@@ -87,6 +87,22 @@ public:
 
     int try_evict_component_batch(ComponentType component, int target_slots);
 
+    // Pressure migration, step 1: up to `max_leaves` unpinned LRU leaves,
+    // coldest first, each as its full root->leaf cumulative hash path (the key
+    // a peer re-walks on remote insert). Paths deeper than `max_blocks` are
+    // skipped; at most `scan_limit` leaves are visited (<= 0: no limit).
+    // Read-only: read_lock + lru_lock, nothing is touched or pinned.
+    std::vector<std::vector<uint64_t>> peek_lru_leaf_paths(int max_leaves, int max_blocks,
+                                                           int scan_limit = 0);
+
+    // Pressure migration, last step: drop the chain `hashes` ends in once a
+    // peer holds it. Evicts the node whose END is exactly n, then every
+    // ancestor that is left a childless, unpinned non-root leaf; stops at a
+    // branch, a pin or the root. Nothing is evicted when the path no longer
+    // ends on a node boundary or the terminal node has children. Returns the
+    // FULL blocks freed; RHT cleanup fires after the lock drops.
+    int evict_chain(const uint64_t* hashes, int n);
+
     std::vector<NodeBoundary> get_node_boundaries(const uint64_t* hashes, int n);
 
     // Component-aware peer of query(): mask selects enabled components, lock

@@ -1714,6 +1714,72 @@ int RadixShmemTree::try_evict_batch(int target_blocks) {
     return freed;
 }
 
+std::vector<std::vector<uint64_t>> RadixShmemTree::peek_lru_leaf_paths(int max_leaves,
+                                                                        int max_blocks,
+                                                                        int scan_limit) {
+    std::vector<std::vector<uint64_t>> out;
+    if (max_leaves <= 0 || max_blocks <= 0) return out;
+    // Readers move leaves under lru_lock; writers (insert/evict) are excluded by
+    // the read lock, so the list and every parent chain are stable here.
+    read_lock();
+    lru_lock();
+    const uint32_t root = header()->root_node_id;
+    std::vector<uint32_t> chain;
+    int scanned = 0;
+    for (uint32_t cur = header()->leaf_list_head;
+         cur != INVALID_NODE_ID && (int)out.size() < max_leaves &&
+         (scan_limit <= 0 || scanned < scan_limit);
+         cur = nodes_.get(cur)->leaf_next) {
+        ++scanned;
+        if (cur == root || !component_refs_zero(cur)) continue;
+        chain.clear();
+        int depth = 0;
+        for (uint32_t id = cur; id != INVALID_NODE_ID && id != root && depth <= max_blocks;
+             id = nodes_.get(id)->parent_id) {
+            chain.push_back(id);
+            depth += (int)nodes_.get(id)->num_blocks;
+        }
+        if (depth <= 0 || depth > max_blocks) continue;
+        std::vector<uint64_t> path;
+        path.reserve(depth);
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            const TreeNode* nd = nodes_.get(*it);
+            const uint64_t* h = data_.get_hashes(nd->data_offset);
+            path.insert(path.end(), h, h + nd->num_blocks);
+        }
+        out.push_back(std::move(path));
+    }
+    lru_unlock();
+    read_unlock();
+    return out;
+}
+
+int RadixShmemTree::evict_chain(const uint64_t* hashes, int n) {
+    if (hashes == nullptr || n <= 0) return 0;
+    set_write_op("evict_chain");
+    write_lock();
+    const uint32_t root = header()->root_node_id;
+    QueryInternalDetail m = query_internal(hashes, n, 0, /*touch=*/false);
+    int freed = 0;
+    uint32_t id = m.last_node_id;
+    // Only a path that ends exactly on a node END names a chain to drop.
+    if (m.matched_blocks == n && id != INVALID_NODE_ID && id != root &&
+        m.last_node_matched_blocks == (int)nodes_.get(id)->num_blocks) {
+        std::vector<int32_t> tmp;
+        while (id != INVALID_NODE_ID && id != root) {
+            TreeNode* nd = nodes_.get(id);
+            if (nd->children_count != 0 || !component_refs_zero(id)) break;
+            uint32_t parent = nd->parent_id;
+            tmp.clear();
+            freed += evict_node(id, tmp);
+            id = parent;
+        }
+    }
+    write_unlock();
+    flush_evicted();
+    return freed;
+}
+
 int RadixShmemTree::try_evict_component_batch(ComponentType component,
                                             int target_slots) {
     set_write_op("evict_comp_bg");

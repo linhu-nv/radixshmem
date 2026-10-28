@@ -68,7 +68,7 @@ RemoteStatus RemotePeer::request(const void* req, size_t req_len,
     return transport_->send_request(req, req_len, next_req_id_, reply_out);
 }
 
-AllocateReply RemotePeer::allocate(int n) {
+AllocateReply RemotePeer::allocate(int n, ComponentType component) {
     auto g = guard();
     AllocateReply out;
     // ALLOCATE carries no hashes: n is the slot count, request is header-only.
@@ -81,6 +81,7 @@ AllocateReply RemotePeer::allocate(int n) {
     h->magic   = REMOTE_OP_REQ_MAGIC;
     h->version = REMOTE_OP_PROTOCOL_VERSION;
     h->op      = REMOTE_OP_INSERT_RESERVE;
+    h->component = static_cast<uint16_t>(component);
     h->n       = n;
     h->req_id  = next_req_id_ + 1;
     ++next_req_id_;
@@ -101,7 +102,8 @@ AllocateReply RemotePeer::allocate(int n) {
 RemoteStatus RemotePeer::send_ack_op(uint16_t op, const uint64_t* hashes, int n,
                                  int start, int length,
                                  const int32_t* slots,
-                                 uint16_t flags) {
+                                 uint16_t flags,
+                                 ComponentType component) {
     auto g = guard();
     // Only the two RELEASE ops route here now. INSERT_RELEASE carries a slot
     // count; QUERY_RELEASE length is a hash range (<=n).
@@ -119,6 +121,7 @@ RemoteStatus RemotePeer::send_ack_op(uint16_t op, const uint64_t* hashes, int n,
     }
     ++next_req_id_;
     h->flags           = flags;
+    h->component       = static_cast<uint16_t>(component);
     h->u.insert.start  = start;
     h->u.insert.length = length;
 
@@ -133,7 +136,7 @@ RemoteStatus RemotePeer::send_ack_op(uint16_t op, const uint64_t* hashes, int n,
 
 InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
                                 int start, int length, const int32_t* slots,
-                                bool auto_recycle) {
+                                bool auto_recycle, ComponentType component) {
     auto g = guard();
     InsertResult out;
     if (length < 0 || length > MAX_REMOTE_OP_BLOCKS ||
@@ -153,6 +156,7 @@ InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
     ++next_req_id_;
     h->flags           = auto_recycle ? (uint16_t)0
                                       : REMOTE_OP_FLAG_NO_AUTO_RECYCLE;
+    h->component       = static_cast<uint16_t>(component);
     h->u.insert.start  = start;
     h->u.insert.length = length;
 
@@ -171,11 +175,13 @@ InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
 }
 
 RemoteStatus RemotePeer::release(const uint64_t* hashes, int n,
-                             int start, int length, const int32_t* slots) {
-    // slots present → insert abort (recycle); absent → query pin release.
+                             int start, int length, const int32_t* slots,
+                             ComponentType component) {
+    // slots present → insert abort (recycle into `component`'s pool);
+    // absent → query pin release.
     return send_ack_op(slots ? REMOTE_OP_INSERT_RELEASE
                              : REMOTE_OP_QUERY_RELEASE,
-                       hashes, n, start, length, slots);
+                       hashes, n, start, length, slots, /*flags=*/0, component);
 }
 
 QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
